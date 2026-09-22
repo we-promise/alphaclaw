@@ -1492,6 +1492,93 @@ describe("server/openclaw-channel-sync", () => {
     });
   });
 
+  describe("legacy auth profile store at boot (fresh-install fix)", () => {
+    // Port of jjmata/alphaclaw#1 onto this line's reconcileBootConfig: a
+    // credential-bearing legacy agents/<id>/agent/auth-profiles.json forces
+    // a guarded doctor --fix even when the config migration is already
+    // complete - otherwise a post-onboarding OAuth connect leaves every
+    // agent run failing with AUTH_PROFILE_MIGRATION_REQUIRED.
+    const writeCurrentConfig = (openclawDir) => {
+      fs.mkdirSync(openclawDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(openclawDir, "openclaw.json"),
+        `${JSON.stringify({ gateway: {} }, null, 2)}\n`,
+      );
+    };
+    const writeLegacyAuthStore = (openclawDir, profiles) => {
+      const agentDir = path.join(openclawDir, "agents", "main", "agent");
+      fs.mkdirSync(agentDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(agentDir, "auth-profiles.json"),
+        JSON.stringify({ version: 1, profiles }),
+      );
+    };
+    const seedCompletedMigration = (harness) => {
+      harness.store.updateState((s) => {
+        s.pinVersion = "1.0.0";
+        s.configMigration = {
+          completedForVersion: "1.0.0",
+          lastAttempt: { version: "1.0.0", at: 1, ok: true },
+        };
+        return s;
+      });
+    };
+    const doctorCalls = (harness) =>
+      harness.runner.runStreamed.mock.calls.filter(
+        ([opts]) => Array.isArray(opts?.args) && opts.args[1] === "doctor",
+      );
+    const makeHarness = () => {
+      const harness = createHarness({
+        pin: "1.0.0",
+        installedVersion: "1.0.0",
+        sentinelVersion: "1.0.0",
+      });
+      seedCompletedMigration(harness);
+      writeCurrentConfig(harness.openclawDir);
+      return harness;
+    };
+
+    it("runs doctor for a credential-bearing legacy auth store even when the config migration already completed", async () => {
+      const harness = makeHarness();
+      writeLegacyAuthStore(harness.openclawDir, {
+        "openai:codex-cli": { type: "oauth", provider: "openai" },
+      });
+
+      const outcome = await harness.sync.reconcileBootConfig();
+
+      expect(outcome.status).toBe("ok");
+      expect(doctorCalls(harness)).toHaveLength(1);
+      expect(doctorCalls(harness)[0][0].args.slice(1)).toEqual([
+        "doctor",
+        "--fix",
+        "--yes",
+      ]);
+    });
+
+    it("keeps the already-completed fast path when the legacy auth store has no profiles", async () => {
+      const harness = makeHarness();
+      writeLegacyAuthStore(harness.openclawDir, {});
+
+      const outcome = await harness.sync.reconcileBootConfig();
+
+      expect(outcome).toEqual(
+        expect.objectContaining({ status: "ok", reason: "already-completed" }),
+      );
+      expect(doctorCalls(harness)).toHaveLength(0);
+    });
+
+    it("keeps the already-completed fast path when no legacy auth store exists", async () => {
+      const harness = makeHarness();
+
+      const outcome = await harness.sync.reconcileBootConfig();
+
+      expect(outcome).toEqual(
+        expect.objectContaining({ status: "ok", reason: "already-completed" }),
+      );
+      expect(doctorCalls(harness)).toHaveLength(0);
+    });
+  });
+
   describe("applyUpdate", () => {
     it("never lets old apply steps or completion rewrite a replacement history pointer", async () => {
       let store;
