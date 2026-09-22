@@ -1497,7 +1497,10 @@ describe("server/openclaw-channel-sync", () => {
     // credential-bearing legacy agents/<id>/agent/auth-profiles.json forces
     // a guarded doctor --fix even when the config migration is already
     // complete - otherwise a post-onboarding OAuth connect leaves every
-    // agent run failing with AUTH_PROFILE_MIGRATION_REQUIRED.
+    // agent run failing with AUTH_PROFILE_MIGRATION_REQUIRED. The forced run
+    // is gated to the sqlite-auth-store era (>= 2026.9.1) and skipped once
+    // the auth.sharedStore machine-state flag owns the credentials.
+    const kEraVersion = "2026.9.3";
     const writeCurrentConfig = (openclawDir) => {
       fs.mkdirSync(openclawDir, { recursive: true });
       fs.writeFileSync(
@@ -1505,20 +1508,36 @@ describe("server/openclaw-channel-sync", () => {
         `${JSON.stringify({ gateway: {} }, null, 2)}\n`,
       );
     };
+    const legacyAuthStorePath = (openclawDir) =>
+      path.join(openclawDir, "agents", "main", "agent", "auth-profiles.json");
     const writeLegacyAuthStore = (openclawDir, profiles) => {
-      const agentDir = path.join(openclawDir, "agents", "main", "agent");
-      fs.mkdirSync(agentDir, { recursive: true });
+      fs.mkdirSync(path.dirname(legacyAuthStorePath(openclawDir)), {
+        recursive: true,
+      });
       fs.writeFileSync(
-        path.join(agentDir, "auth-profiles.json"),
+        legacyAuthStorePath(openclawDir),
         JSON.stringify({ version: 1, profiles }),
       );
     };
-    const seedCompletedMigration = (harness) => {
+    const writeSharedStoreFlag = (openclawDir) => {
+      const { DatabaseSync } = require("node:sqlite");
+      const stateDir = path.join(openclawDir, "state");
+      fs.mkdirSync(stateDir, { recursive: true });
+      const db = new DatabaseSync(path.join(stateDir, "openclaw.sqlite"));
+      db.exec(
+        "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT)",
+      );
+      db.prepare(
+        "INSERT INTO config_machine_state (state_key, value_json) VALUES (?, ?)",
+      ).run("auth.sharedStore", JSON.stringify({ location: "state-db" }));
+      db.close();
+    };
+    const seedCompletedMigration = (harness, version) => {
       harness.store.updateState((s) => {
-        s.pinVersion = "1.0.0";
+        s.pinVersion = version;
         s.configMigration = {
-          completedForVersion: "1.0.0",
-          lastAttempt: { version: "1.0.0", at: 1, ok: true },
+          completedForVersion: version,
+          lastAttempt: { version, at: 1, ok: true },
         };
         return s;
       });
@@ -1527,22 +1546,33 @@ describe("server/openclaw-channel-sync", () => {
       harness.runner.runStreamed.mock.calls.filter(
         ([opts]) => Array.isArray(opts?.args) && opts.args[1] === "doctor",
       );
-    const makeHarness = () => {
+    const makeHarness = ({ version = kEraVersion, runnerImpl = null } = {}) => {
       const harness = createHarness({
-        pin: "1.0.0",
-        installedVersion: "1.0.0",
-        sentinelVersion: "1.0.0",
+        pin: version,
+        installedVersion: version,
+        sentinelVersion: version,
+        ...(runnerImpl ? { runnerImpl } : {}),
       });
-      seedCompletedMigration(harness);
+      seedCompletedMigration(harness, version);
       writeCurrentConfig(harness.openclawDir);
       return harness;
     };
+    const kCodexProfile = {
+      "openai:codex-cli": { type: "oauth", provider: "openai" },
+    };
 
     it("runs doctor for a credential-bearing legacy auth store even when the config migration already completed", async () => {
-      const harness = makeHarness();
-      writeLegacyAuthStore(harness.openclawDir, {
-        "openai:codex-cli": { type: "oauth", provider: "openai" },
-      });
+      const ref = { dir: null };
+      // The mock doctor performs the migration: it removes the legacy store.
+      const runnerImpl = (opts, fallback) => {
+        if (Array.isArray(opts?.args) && opts.args[1] === "doctor") {
+          fs.rmSync(legacyAuthStorePath(ref.dir), { force: true });
+        }
+        return fallback(opts);
+      };
+      const harness = makeHarness({ runnerImpl });
+      ref.dir = harness.openclawDir;
+      writeLegacyAuthStore(harness.openclawDir, kCodexProfile);
 
       const outcome = await harness.sync.reconcileBootConfig();
 
@@ -1576,6 +1606,57 @@ describe("server/openclaw-channel-sync", () => {
         expect.objectContaining({ status: "ok", reason: "already-completed" }),
       );
       expect(doctorCalls(harness)).toHaveLength(0);
+    });
+
+    it("leaves a credential-bearing legacy store alone on a pre-era build (downgrade target)", async () => {
+      const harness = makeHarness({ version: "2026.8.0" });
+      writeLegacyAuthStore(harness.openclawDir, kCodexProfile);
+
+      const outcome = await harness.sync.reconcileBootConfig();
+
+      expect(outcome).toEqual(
+        expect.objectContaining({ status: "ok", reason: "already-completed" }),
+      );
+      expect(doctorCalls(harness)).toHaveLength(0);
+    });
+
+    it("ignores a leftover legacy store once the shared-store flag owns auth", async () => {
+      const harness = makeHarness();
+      writeLegacyAuthStore(harness.openclawDir, kCodexProfile);
+      writeSharedStoreFlag(harness.openclawDir);
+
+      const outcome = await harness.sync.reconcileBootConfig();
+
+      expect(outcome).toEqual(
+        expect.objectContaining({ status: "ok", reason: "already-completed" }),
+      );
+      expect(doctorCalls(harness)).toHaveLength(0);
+    });
+
+    it("holds the gateway when doctor reports success but the legacy store still owns credentials, and never re-runs doctor on the next boot", async () => {
+      // Default runner: doctor exits 0 but migrates nothing - the legacy
+      // store stays populated and no shared-store flag appears.
+      const harness = makeHarness();
+      writeLegacyAuthStore(harness.openclawDir, kCodexProfile);
+
+      const first = await harness.sync.reconcileBootConfig();
+
+      expect(first.status).toBe("held");
+      expect(String(first.hold?.reason || "")).toContain(
+        "legacy auth profile store",
+      );
+      expect(doctorCalls(harness)).toHaveLength(1);
+      expect(
+        harness.store.readState().configMigration?.lastAttempt?.ok,
+      ).toBe(false);
+
+      // Next boot: the cross-boot re-attempt gate keeps the hold without
+      // spending the sized doctor budget again.
+      const second = await harness.sync.reconcileBootConfig();
+      expect(second).toEqual(
+        expect.objectContaining({ status: "held", reused: true }),
+      );
+      expect(doctorCalls(harness)).toHaveLength(1);
     });
   });
 
